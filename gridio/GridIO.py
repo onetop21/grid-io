@@ -3,6 +3,7 @@ import os
 import io
 from enum import IntEnum
 import tempfile
+from urllib.parse import urlparse
 from pymongo import MongoClient
 import gridfs
 import boto3
@@ -13,62 +14,6 @@ import logging
 loglevel = os.environ.get('loglevel', logging.ERROR)
 logging.basicConfig(level=int(loglevel), datefmt='%Y-%M-%d %H:%M:%S', format='[%(levelname)s] %(asctime)s.%(msecs)03d (%(name)s) - %(message)s')
 logger = logging.getLogger(__name__)
-
-class GridIOWrapper:
-    def __init__(self, fs, bucket, filename, mode='r'):
-        self.__filename = filename
-        self.__fs = fs
-        self.__bucket = bucket
-        self.__mode = mode
-
-        self.__need_preload = True in [_ in mode for _ in ['r', 'a']]
-        self.__need_update = True in [_ in mode for _ in ['w', 'a']]
-        self.__need_append = 'a' in mode
-        self.__temp = tempfile.TemporaryFile()
-
-        if self.__need_update:
-            self.__dict__['read'] = None
-        else:
-            self.__dict__['write'] = None
-            
-    def __enter__(self):
-        self.open()
-        return self
-
-    def __exit__(self, exc, val, tb):
-        self.close()
-
-    def open(self):
-        if self.__need_preload and self.__fs.exists(filename=self.__filename):
-            self.__bucket.download_to_stream_by_name(self.__filename, self.__temp)
-        if not self.__need_append: self.__temp.seek(0)
-
-    def close(self):
-        if self.__need_update:
-            self.__temp.seek(0)
-            self.__bucket.upload_from_stream(self.__filename, self.__temp.read())
-        
-    def read(self, size=-1):
-        buf = self.__temp.read(size)
-        return buf if 'b' in self.__mode else buf.decode()
-
-    def write(self, data):
-        return self.__temp.write(data if 'b' in self.__mode else data.encode())
-
-    def open(self, filepath, mode='r'):
-        wrapper = GridIOWrapper(self.__fs, self.__bucket, filepath, mode) 
-        return wrapper
-
-
-    def find(self, *args, **kwargs):
-        return [ _.filename for _ in self.__fs.find(*args, **kwargs) ]
-    
-    def find_one(self, *args, **kwargs):
-        fp = self.__fs.find_one(*args, **kwargs)
-        if fp:
-            return fp.filename
-        else:
-            return None
 
 class GridIOBucket:
     def __init__(self, name, fs):
@@ -171,7 +116,7 @@ class GridIO:
             raise ValueError(f'Cannot assign instance of {value.__class__.__name__} class.')
     
     def __del__(self):
-        self.release()
+        self.close()
 
     def isExist(self, bucket_name):
         return bucket_name in self.__buckets
@@ -186,7 +131,7 @@ class GridIO:
             self.__buckets[name] = GridIOBucket(name, fs)
         return self.__buckets[name]
     
-    def release(self):
+    def close(self):
         self.__client.close()
     
     def export(self, file, target='/tmp'):
@@ -199,11 +144,15 @@ class GridIO:
             f.write(file.read())
         return target
 
-    def publish(self, file, bucket, obj_name=None, config={}):
+    def publish(self, file, path=None, config={}):
         config['endpoint_url'] = config.get('endpoint_url') or os.environ.get('S3_ENDPOINT', 'http://localhost:9000')
         config['aws_access_key_id'] = config.get('aws_access_key_id') or os.environ.get('AWS_ACCESS_KEY_ID', '')
         config['aws_secret_access_key'] = config.get('aws_secret_access_key') or os.environ.get('AWS_SECRET_ACCESS_KEY', '')
         s3 = boto3.resource('s3', **config)
+        uri = urlparse(path)
+        scheme = uri.scheme
+        bucket = uri.netloc
+        obj_name = uri.path
         try:
             s3.upload_fileobj(file, bucket, obj_name or file.name, ExtraArgs={'Metadata': file.metadata})
         except ClientError as e:
